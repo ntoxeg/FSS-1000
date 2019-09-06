@@ -12,6 +12,7 @@ import random
 import cv2
 import subprocess
 import time
+import gc
 
 parser = argparse.ArgumentParser(description="One Shot Visual Recognition")
 parser.add_argument("-f","--feature_dim",type = int, default = 64)
@@ -30,8 +31,8 @@ parser.add_argument("-modelf","--feature_encoder_model",type=str,default='models
 parser.add_argument("-modelr","--relation_network_model",type=str,default='models/relation_network.pkl')
 parser.add_argument("-sd","--support_dir",type=str,default='data/african_elephant/supp')
 parser.add_argument("-td","--test_dir",type=str,default='data/african_elephant/test')
-parser.add_argument("--img_w", type=int, default=1024)
-parser.add_argument("--img_h", type=int, default=768)
+parser.add_argument("--img_w", type=int, default=224)
+parser.add_argument("--img_h", type=int, default=224)
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"]=str(np.argmax( [int(x.split()[2]) \
@@ -167,12 +168,11 @@ def get_oneshot_batch(testname):  #shuffle in query_images not done
     # classes_name = os.listdir('./%s' % args.support_dir)
     # classes_name = ['android_robot', 'bucket_water' , 'nintendo_gameboy']
 
-
-    support_images = np.zeros((CLASS_NUM*SAMPLE_NUM_PER_CLASS,3,IMAGE_WIDTH,IMAGE_HEIGHT), dtype=np.float32)
-    support_labels = np.zeros((CLASS_NUM*SAMPLE_NUM_PER_CLASS,CLASS_NUM,IMAGE_WIDTH,IMAGE_HEIGHT), dtype=np.float32)
-    query_images = np.zeros((CLASS_NUM*BATCH_NUM_PER_CLASS,3,IMAGE_WIDTH,IMAGE_HEIGHT), dtype=np.float32)
-    query_labels = np.zeros((CLASS_NUM*BATCH_NUM_PER_CLASS,CLASS_NUM,IMAGE_WIDTH,IMAGE_HEIGHT), dtype=np.float32)
-    zeros = np.zeros((CLASS_NUM*BATCH_NUM_PER_CLASS,1,IMAGE_WIDTH,IMAGE_HEIGHT), dtype=np.float32)
+    support_images = np.zeros((CLASS_NUM*SAMPLE_NUM_PER_CLASS,3,IMAGE_HEIGHT,IMAGE_WIDTH), dtype=np.float32)
+    support_labels = np.zeros((CLASS_NUM*SAMPLE_NUM_PER_CLASS,CLASS_NUM,IMAGE_HEIGHT,IMAGE_WIDTH), dtype=np.float32)
+    query_images = np.zeros((CLASS_NUM*BATCH_NUM_PER_CLASS,3,IMAGE_HEIGHT,IMAGE_WIDTH), dtype=np.float32)
+    query_labels = np.zeros((CLASS_NUM*BATCH_NUM_PER_CLASS,CLASS_NUM,IMAGE_HEIGHT,IMAGE_WIDTH), dtype=np.float32)
+    zeros = np.zeros((CLASS_NUM*BATCH_NUM_PER_CLASS,1,IMAGE_HEIGHT,IMAGE_WIDTH), dtype=np.float32)
     class_cnt = 0
 
     # print ('class %s is chosen' % i)
@@ -185,19 +185,22 @@ def get_oneshot_batch(testname):  #shuffle in query_images not done
     j = 0
     for k in chosen_index:
         # process image
-        image = cv2.imread('%s/image/%s' % (args.support_dir, imgnames[k].replace('.png', '.jpg')))
-        image = pad_image(image)
+        imgname = '%s/image/%s' % (args.support_dir, imgnames[k].replace('.png', '.jpg'))
+        image = cv2.imread(imgname)
         if image is None:
-            raise Exception('cannot load image ')
+            raise Exception(f'cannot load image {imgname}')
+        image = cv2.resize(image, (IMAGE_WIDTH, IMAGE_HEIGHT))
+        # image = pad_image(image)
 
         image = image[:,:,::-1] # bgr to rgb
         image = image / 255.0
-        image = np.transpose(image, (2, 1, 0))
+        image = np.transpose(image, (2, 0, 1))
         # labels
         # print ('%s/label/%s' % (args.support_dir, imgnames[k]))
         label = cv2.imread('%s/label/%s' % (args.support_dir, imgnames[k]))[:,:,0]
-        label = pad_image(label)
-        label = np.transpose(label, (1, 0))
+        label = cv2.resize(label, (IMAGE_WIDTH, IMAGE_HEIGHT))
+        # label = pad_image(label)
+        # label = np.transpose(label, (1, 0))
 
         support_images[k] = image
         support_labels[k][0] = label
@@ -207,7 +210,7 @@ def get_oneshot_batch(testname):  #shuffle in query_images not done
     # testimage = pad_image(testimage)
     testimage = testimage[:,:,::-1] # bgr to rgb
     testimage = testimage / 255.0
-    testimage = np.transpose(testimage, (2, 1, 0))
+    testimage = np.transpose(testimage, (2, 0, 1))
 
     query_images[0] = testimage
 
@@ -240,7 +243,7 @@ def get_pascal_labels():
 def encode_segmap(mask):
     """Encode segmentation label images as pascal classes
 
-    Args:
+    Args:label
         mask (np.ndarray): raw segmentation label image of dimension
           (M, N, 3), in which the Pascal classes are encoded as colours.
 
@@ -355,7 +358,7 @@ def main():
 
     for cnt, testname in enumerate(testnames):
 
-        print ('%s / %s' % (cnt, len(testnames)))
+        print ('%s / %s' % (cnt + 1, len(testnames)))
         print (testname)
         testimage = cv2.imread('%s/%s' % (args.test_dir, testname))
         if testimage is None:
@@ -370,14 +373,17 @@ def main():
         with torch.no_grad():
             sample_features, _ = feature_encoder(Variable(samples).cuda(GPU))
             # print(sample_features.shape)
-            sample_features = sample_features.view(CLASS_NUM,SAMPLE_NUM_PER_CLASS,512,32,24)
+            sample_features = sample_features.view(CLASS_NUM,SAMPLE_NUM_PER_CLASS,512,7,7)
             sample_features = torch.sum(sample_features,1).squeeze(1) # 1*512*7*7
+            # print(sample_features.shape)
             batch_features, ft_list = feature_encoder(Variable(batches).cuda(GPU))
             sample_features_ext = sample_features.unsqueeze(0).repeat(BATCH_NUM_PER_CLASS*CLASS_NUM,1,1,1,1)
+            # print(sample_features_ext.shape)
             batch_features_ext = batch_features.unsqueeze(0).repeat(CLASS_NUM,1,1,1,1)
             batch_features_ext = torch.transpose(batch_features_ext,0,1)
-            relation_pairs = torch.cat((sample_features_ext,batch_features_ext),2).view(-1,1024,32,24)
-            output = relation_network(relation_pairs,ft_list).view(-1,CLASS_NUM,IMAGE_WIDTH, IMAGE_HEIGHT)
+            relation_pairs = torch.cat((sample_features_ext,batch_features_ext), 2).view(-1,1024,7,7)
+            # print(relation_pairs.shape, ft_list[0].shape)
+            output = relation_network(relation_pairs, ft_list).view(-1, CLASS_NUM, IMAGE_HEIGHT, IMAGE_WIDTH)
 
         classiou = 0
         for i in range(0, batches.size()[0]):
@@ -414,6 +420,12 @@ def main():
         testedge = cv2.Canny(testlabel,1,1)
         cv2.imwrite('./result1/%s/test%s_raw.png' % (classname, cnt), testimg) #raw image
         cv2.imwrite('./result1/%s/test%s.png' % (classname,cnt), maskimg(testimg, testlabel.copy()[:,:,0], testedge))
+        del testimage
+        del testimg
+        del sample_features_ext
+        del batch_features_ext
+        torch.cuda.empty_cache()
+        gc.collect()
 
 if __name__ == '__main__':
     main()
